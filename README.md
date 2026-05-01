@@ -59,3 +59,14 @@ pip install -r requirements.txt
 ## Sign Language Inference Module
 
 This feature supports sign-language video input and converts it into predicted text output for the MVP demo.
+
+
+## Unified MVP Workflow
+
+Current implemented system flow:
+
+1. Sign Language Video -> Text -> Speech
+2. Speech Audio -> Text
+3. Face Image -> Age Prediction
+
+All modules are accessible through the unified main.py entry point.

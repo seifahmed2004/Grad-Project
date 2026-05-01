@@ -1,0 +1,5 @@
+Put these model files here before running:
+- asl_rgb_200_last.pth
+- best.pt
+- best_speech_model.pth
+- best_age_resnet18.pth

@@ -1,3 +1,5 @@
+# Unified main entry point for the MVP modules.
+# Supports Sign Language to Text, Text to Speech, Speech to Text, and Age Prediction.
 import os
 import json
 import argparse

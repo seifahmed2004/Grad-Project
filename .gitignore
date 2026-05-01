@@ -1,0 +1,9 @@
+models/*.pth
+models/*.pt
+outputs/*
+__pycache__/
+interfaces/__pycache__/
+*.pyc
+*.wav
+*.mp4
+*.jpg

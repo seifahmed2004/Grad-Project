@@ -7,3 +7,4 @@ soundfile
 unidecode
 torchaudio
 pillow
+sklearn

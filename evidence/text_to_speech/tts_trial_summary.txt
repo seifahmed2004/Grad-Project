@@ -1,0 +1,29 @@
+Text-to-Speech Trial Summary
+
+Owner:
+Mohamed Osama Darwish
+
+Old Trial:
+The first functional TTS attempt used a Tacotron-style acoustic model with Griffin-Lim waveform reconstruction.
+
+Result:
+The model generated audio, but the sound was robotic and buzzy.
+
+Reason:
+The limitation was caused by Griffin-Lim, which is a classical vocoder and does not learn realistic waveform generation.
+
+Improvement:
+To improve audio quality while keeping the project fully from scratch, a HiFi-GAN neural vocoder was implemented from zero and added as the next stage of the TTS pipeline.
+
+Files kept as evidence:
+- Old training script
+- HPC training script
+- Run script
+- Training summary plot
+- Final attention and mel-spectrogram plot
+
+Files not pushed to GitHub:
+- best.pt
+- latest.pt
+- custom_output.wav
+- final_demo.wav

@@ -1,0 +1,1114 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # From-Scratch TTS — Final Version (v6)
+# **Run on Kaggle with 2x T4 GPU**
+# 
+# Pipeline: `text → character IDs → Tacotron2-style acoustic model → mel spectrogram → Griffin-Lim → .wav`
+
+# # CELL 1 — Install minimal dependencies
+
+
+
+
+# # CELL 2 — Imports and reproducibility seed
+# 
+
+
+import os
+import re
+import math
+import argparse
+import time
+import json
+import random
+import warnings
+import wave
+import contextlib
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+import librosa
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from unidecode import unidecode
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+warnings.filterwarnings('ignore')
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+n_gpus = torch.cuda.device_count()
+print(f'Device: {device}  |  GPUs available: {n_gpus}')
+for i in range(n_gpus):
+    print(f'  GPU {i}: {torch.cuda.get_device_name(i)}')
+
+
+# # CELL 3 — Configuration
+
+
+# Audio
+SAMPLE_RATE    = 22050
+N_FFT          = 1024
+WIN_LENGTH     = 1024
+HOP_LENGTH     = 256
+N_MELS         = 80
+FMIN           = 0
+FMAX           = 8000
+
+# Data filtering
+MIN_TEXT_LEN   = 5
+MAX_TEXT_LEN   = 180
+MIN_MEL_LEN    = 20
+MAX_MEL_LEN    = 870
+
+# DataLoader
+VAL_SIZE       = 300
+BATCH_SIZE     = 16
+NUM_WORKERS    = 2
+PIN_MEMORY     = True
+
+# Model dimensions
+EMBED_DIM          = 256
+ENC_HIDDEN         = 256
+DEC_HIDDEN         = 512
+ATTN_DIM           = 128
+LOCATION_FILTERS   = 32
+LOCATION_KERNEL    = 31
+PRENET_DIM         = 256
+POSTNET_CHANNELS   = 512
+POSTNET_KERNEL     = 5
+REDUCTION_FACTOR   = 2
+
+# Training schedule
+EPOCHS                   = 250
+LR                       = 1e-3
+LR_MIN                   = 5e-5
+WEIGHT_DECAY             = 1e-6
+GRAD_CLIP                = 1.0
+EARLY_STOPPING_PATIENCE  = 25
+USE_AMP                  = (n_gpus > 0)
+
+# Teacher forcing
+TF_HOLD_FRAC    = 0.40
+TF_START        = 1.0
+TF_END          = 0.85
+
+# Guided attention
+GA_HOLD_FRAC    = 0.30
+GA_MAX          = 1.0
+GA_MIN          = 0.05
+GA_G            = 0.2
+
+# Loss weights
+STOP_POS_WEIGHT = 8.0
+
+# Inference defaults
+INFER_STOP_THRESHOLD  = 0.55
+INFER_MIN_STEPS       = 50
+INFER_MAX_STEPS       = 900
+
+# Paths and CLI
+DEFAULT_WORK_DIR = Path.home() / 'projects' / 'tts_project'
+DEFAULT_DATA_DIR = DEFAULT_WORK_DIR / 'data' / 'LJSpeech-1.1'
+
+parser = argparse.ArgumentParser(description='Train from-scratch TTS on LJSpeech')
+parser.add_argument('--work-dir', type=str, default=str(DEFAULT_WORK_DIR))
+parser.add_argument('--data-dir', type=str, default=str(DEFAULT_DATA_DIR))
+parser.add_argument('--epochs', type=int, default=EPOCHS)
+parser.add_argument('--batch-size', type=int, default=BATCH_SIZE)
+parser.add_argument('--num-workers', type=int, default=NUM_WORKERS)
+parser.add_argument('--griffin-lim-iters', type=int, default=80)
+parser.add_argument('--sample-text', type=str, default='Hello, this is my graduation project text to speech model, built completely from scratch.')
+args = parser.parse_args()
+
+EPOCHS = args.epochs
+BATCH_SIZE = args.batch_size
+NUM_WORKERS = args.num_workers
+
+WORK_DIR   = Path(args.work_dir)
+CKPT_DIR   = WORK_DIR / 'checkpoints'
+SAMPLE_DIR = WORK_DIR / 'samples'
+PLOT_DIR   = WORK_DIR / 'plots'
+LOG_DIR    = WORK_DIR / 'logs'
+
+for p in [WORK_DIR, CKPT_DIR, SAMPLE_DIR, PLOT_DIR, LOG_DIR]:
+    p.mkdir(parents=True, exist_ok=True)
+
+LATEST_CKPT = CKPT_DIR / 'latest.pt'
+BEST_CKPT   = CKPT_DIR / 'best.pt'
+
+print('Config ready. Work dir:', WORK_DIR)
+print('Data dir:', args.data_dir)
+print(f'Hyperparams | epochs={EPOCHS} batch_size={BATCH_SIZE} num_workers={NUM_WORKERS}')
+
+
+# # CELL 4 — Find LJSpeech dataset
+# 
+
+
+def find_ljspeech(search_root='/kaggle/input'):
+    for root, dirs, files in os.walk(search_root):
+        if 'metadata.csv' in files and 'wavs' in dirs:
+            return Path(root)
+    return None
+
+LJSPEECH_PATH = find_ljspeech()
+if LJSPEECH_PATH is None:
+    raise FileNotFoundError(
+        'LJSpeech not found under /kaggle/input.\n'
+        'Please attach the dataset: Data -> Add Data -> search "ljspeech" -> add LJSpeech-1.1'
+    )
+
+CSV_PATH  = LJSPEECH_PATH / 'metadata.csv'
+WAVS_DIR  = LJSPEECH_PATH / 'wavs'
+print('LJSpeech found:', LJSPEECH_PATH)
+print('metadata.csv:', CSV_PATH.exists())
+print('wavs dir:', WAVS_DIR.exists())
+
+
+# # CELL 5 — Text cleaning and character vocabulary
+# 
+
+
+_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789 .,!?;:'-\"()"
+
+PAD_SYM = '<pad>'
+SOS_SYM = '<sos>'
+EOS_SYM = '<eos>'
+
+vocab  = [PAD_SYM, SOS_SYM, EOS_SYM] + list(_CHARS)
+stoi   = {s: i for i, s in enumerate(vocab)}
+itos   = {i: s for s, i in stoi.items()}
+
+PAD_ID = stoi[PAD_SYM]
+SOS_ID = stoi[SOS_SYM]
+EOS_ID = stoi[EOS_SYM]
+
+VOCAB_SIZE = len(vocab)
+
+_ws_re      = re.compile(r'\s+')
+_allowed_re = re.compile(r"[^a-z0-9 .,!?;:'\"()\-]+")
+
+def clean_text(text: str) -> str:
+    text = unidecode(str(text))
+    text = text.lower()
+    text = text.replace('\u201c', '"').replace('\u201d', '"').replace('\u2019', "'")
+    text = _allowed_re.sub(' ', text)
+    text = _ws_re.sub(' ', text).strip()
+    return text
+
+def text_to_ids(text: str):
+    text = clean_text(text)
+    ids  = [SOS_ID] + [stoi.get(ch, PAD_ID) for ch in text] + [EOS_ID]
+    return ids
+
+# Quick sanity check
+test_ids = text_to_ids('Hello, world!')
+print(f'Vocab size: {VOCAB_SIZE}')
+print(f'Example IDs (hello, world!): {test_ids}')
+print(f'Decoded: {[itos[i] for i in test_ids]}')
+
+
+# # CELL 6 — Load and filter metadata
+# 
+
+
+def estimate_mel_len(wav_path):
+    """Fast mel length estimate without loading audio."""
+    with contextlib.closing(wave.open(str(wav_path), 'rb')) as wf:
+        n_frames = wf.getnframes()
+    return math.ceil(n_frames / HOP_LENGTH)
+
+records = []
+dropped = 0
+
+with open(CSV_PATH, 'r', encoding='utf-8') as f:
+    for line in f:
+        parts = line.rstrip('\n').split('|')
+        if len(parts) < 2:
+            continue
+        utt_id   = parts[0]
+        raw_text = parts[1] if len(parts) > 1 else ''
+        norm_text = parts[2] if len(parts) > 2 else raw_text
+
+        wav_path = WAVS_DIR / f'{utt_id}.wav'
+        if not wav_path.exists():
+            dropped += 1
+            continue
+
+        text = clean_text(norm_text if norm_text.strip() else raw_text)
+        if not (MIN_TEXT_LEN <= len(text) <= MAX_TEXT_LEN):
+            dropped += 1
+            continue
+
+        try:
+            mel_len = estimate_mel_len(wav_path)
+        except Exception:
+            dropped += 1
+            continue
+
+        if not (MIN_MEL_LEN <= mel_len <= MAX_MEL_LEN):
+            dropped += 1
+            continue
+
+        records.append({
+            'id':       utt_id,
+            'text':     text,
+            'wav_path': str(wav_path),
+            'mel_len':  mel_len,
+        })
+
+random.shuffle(records)
+
+val_size    = min(VAL_SIZE, max(100, len(records) // 20))
+val_records = records[:val_size]
+trn_records = records[val_size:]
+
+print(f'Total usable: {len(records)}  |  Dropped: {dropped}')
+print(f'Train: {len(trn_records)}  |  Val: {val_size}')
+
+
+# # CELL 7 — Audio helpers
+# 
+
+
+def load_wav(path: str) -> np.ndarray:
+    wav, sr = sf.read(path)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    wav = wav.astype(np.float32)
+    if sr != SAMPLE_RATE:
+        wav = librosa.resample(wav, orig_sr=sr, target_sr=SAMPLE_RATE)
+    return np.clip(wav, -1.0, 1.0)
+
+def wav_to_log_mel(wav: np.ndarray) -> np.ndarray:
+    """Returns [T, N_MELS] float32."""
+    mel = librosa.feature.melspectrogram(
+        y=wav, sr=SAMPLE_RATE,
+        n_fft=N_FFT, hop_length=HOP_LENGTH,
+        win_length=WIN_LENGTH, n_mels=N_MELS,
+        fmin=FMIN, fmax=FMAX, power=1.0
+    )
+    return np.log(np.maximum(mel, 1e-5)).astype(np.float32).T  # [T, 80]
+
+def log_mel_to_audio(mel_log: np.ndarray, n_iter: int = None) -> np.ndarray:
+    """Griffin-Lim inversion. mel_log shape: [T, N_MELS]."""
+    if n_iter is None:
+        n_iter = args.griffin_lim_iters
+    mel_log = mel_log.astype(np.float32)
+    mel     = np.exp(mel_log.T)  # [80, T]
+    audio   = librosa.feature.inverse.mel_to_audio(
+        mel, sr=SAMPLE_RATE,
+        n_fft=N_FFT, hop_length=HOP_LENGTH,
+        win_length=WIN_LENGTH, fmin=FMIN, fmax=FMAX,
+        power=1.0, n_iter=n_iter
+    )
+    return np.clip(audio, -1.0, 1.0).astype(np.float32)
+
+# Sanity check
+sample_rec = trn_records[0]
+_wav = load_wav(sample_rec['wav_path'])
+_mel = wav_to_log_mel(_wav)
+print(f'Sample wav shape: {_wav.shape}  mel shape: {_mel.shape}')
+print(f'Mel range: [{_mel.min():.2f}, {_mel.max():.2f}]')
+
+
+# # CELL 8 — Dataset and collate
+# 
+
+
+class LJTTSDataset(Dataset):
+    def __init__(self, records):
+        self.records = records
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        rec  = self.records[idx]
+        ids  = np.array(text_to_ids(rec['text']), dtype=np.int64)
+        wav  = load_wav(rec['wav_path'])
+        mel  = wav_to_log_mel(wav)  # [T, 80]
+        return {'ids': ids, 'mel': mel, 'text': rec['text']}
+
+
+def collate_fn(batch):
+    # Sort by input length descending (required for pack_padded_sequence)
+    batch = sorted(batch, key=lambda x: len(x['ids']), reverse=True)
+
+    input_lens = [len(b['ids']) for b in batch]
+    mel_lens   = [b['mel'].shape[0] for b in batch]
+
+    max_il  = max(input_lens)
+    max_ml  = max(mel_lens)
+    # Pad mel length to be divisible by REDUCTION_FACTOR
+    if max_ml % REDUCTION_FACTOR != 0:
+        max_ml += REDUCTION_FACTOR - (max_ml % REDUCTION_FACTOR)
+
+    B = len(batch)
+    ids_t  = torch.full((B, max_il), PAD_ID, dtype=torch.long)
+    mels_t = torch.zeros((B, max_ml, N_MELS), dtype=torch.float32)
+    # Stop targets: 1 at every position from (mel_end - 1) onwards
+    reduced_max = max_ml // REDUCTION_FACTOR
+    stop_t = torch.zeros((B, reduced_max), dtype=torch.float32)
+
+    for i, b in enumerate(batch):
+        il = input_lens[i]
+        ml = mel_lens[i]
+        ids_t[i, :il]  = torch.tensor(b['ids'], dtype=torch.long)
+        mels_t[i, :ml] = torch.tensor(b['mel'], dtype=torch.float32)
+        reduced_len     = math.ceil(ml / REDUCTION_FACTOR)
+        stop_t[i, reduced_len - 1:] = 1.0
+
+    return (
+        ids_t,
+        torch.tensor(input_lens, dtype=torch.long),
+        mels_t,
+        torch.tensor(mel_lens, dtype=torch.long),
+        stop_t,
+        [b['text'] for b in batch],
+    )
+
+
+train_loader = DataLoader(
+    LJTTSDataset(trn_records),
+    batch_size=BATCH_SIZE, shuffle=True,
+    num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+    collate_fn=collate_fn, drop_last=True,
+)
+
+val_loader = DataLoader(
+    LJTTSDataset(val_records),
+    batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+    collate_fn=collate_fn,
+)
+
+print(f'Train batches per epoch: {len(train_loader)}')
+print(f'Val   batches per epoch: {len(val_loader)}')
+
+# Quick batch shape check
+_ids, _il, _mels, _ml, _stop, _texts = next(iter(train_loader))
+print(f'ids: {_ids.shape}  mels: {_mels.shape}  stop: {_stop.shape}')
+
+
+# # CELL 9 — Model definition
+# -Tacotron 2-style with:
+# - Conv + BiLSTM encoder
+# - Location-sensitive attention
+# - Prenet + LSTM decoder
+# - Postnet refinement
+# - Stop token prediction
+
+
+class Prenet(nn.Module):
+    """Two FC layers with always-on dropout (even at inference)."""
+    def __init__(self, in_dim, sizes=(256, 256), dropout=0.5):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.Linear(in_dim if i == 0 else sizes[i-1], sizes[i])
+            for i in range(len(sizes))
+        ])
+        self.dp = dropout
+
+    def forward(self, x):
+        for lin in self.layers:
+            x = F.relu(lin(x))
+            # training=True keeps dropout active at inference (important!)
+            x = F.dropout(x, p=self.dp, training=True)
+        return x
+
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim=256, hidden_dim=256):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=PAD_ID)
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(embed_dim, embed_dim, kernel_size=5, padding=2),
+                nn.BatchNorm1d(embed_dim),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+            ) for _ in range(3)
+        ])
+        self.bilstm = nn.LSTM(
+            embed_dim, hidden_dim,
+            batch_first=True, bidirectional=True
+        )
+
+    def forward(self, x, lengths):
+        x = self.embedding(x).transpose(1, 2)   # [B, C, T]
+        for conv in self.convs:
+            x = conv(x)
+        x = x.transpose(1, 2)                   # [B, T, C]
+
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=True
+        )
+        out, _ = self.bilstm(packed)
+
+        out, _ = nn.utils.rnn.pad_packed_sequence(
+            out,
+            batch_first=True,
+            total_length=x.size(1)
+        )
+        return out  # [B, T, 2*hidden_dim]
+
+
+class LocationLayer(nn.Module):
+    def __init__(self, n_filters, kernel_size, attn_dim):
+        super().__init__()
+        pad = (kernel_size - 1) // 2
+        self.conv  = nn.Conv1d(2, n_filters, kernel_size=kernel_size, padding=pad, bias=False)
+        self.dense = nn.Linear(n_filters, attn_dim, bias=False)
+
+    def forward(self, attn_cat):  # attn_cat: [B, 2, T_enc]
+        return self.dense(self.conv(attn_cat).transpose(1, 2))  # [B, T_enc, attn_dim]
+
+
+class LocationSensitiveAttention(nn.Module):
+    def __init__(self, enc_dim, dec_dim, attn_dim):
+        super().__init__()
+        self.query_layer    = nn.Linear(dec_dim, attn_dim, bias=False)
+        self.memory_layer   = nn.Linear(enc_dim, attn_dim, bias=False)
+        self.v              = nn.Linear(attn_dim, 1, bias=True)
+        self.location_layer = LocationLayer(LOCATION_FILTERS, LOCATION_KERNEL, attn_dim)
+
+    def forward(self, query, memory, processed_memory, attn_cat, mask):
+        # query: [B, dec_dim]
+        # memory: [B, T_enc, enc_dim]
+        # processed_memory: [B, T_enc, attn_dim]  (pre-computed)
+        # attn_cat: [B, 2, T_enc]  (prev + cum attention)
+        # mask: [B, T_enc] bool
+        pq  = self.query_layer(query).unsqueeze(1)    # [B, 1, attn_dim]
+        pl  = self.location_layer(attn_cat)           # [B, T_enc, attn_dim]
+        energy = self.v(torch.tanh(pq + pl + processed_memory)).squeeze(-1)  # [B, T_enc]
+        if mask is not None:
+            energy.data.masked_fill_(~mask, -float('inf'))
+        weights = F.softmax(energy, dim=1)  # [B, T_enc]
+        context = torch.bmm(weights.unsqueeze(1), memory).squeeze(1)  # [B, enc_dim]
+        return weights, context
+
+
+class Postnet(nn.Module):
+    def __init__(self, n_mels=80, channels=512, kernel=5, n_convs=5, dropout=0.5):
+        super().__init__()
+        layers = []
+        in_ch  = n_mels
+        for i in range(n_convs):
+            out_ch = n_mels if i == n_convs - 1 else channels
+            act    = nn.Identity() if i == n_convs - 1 else nn.Tanh()
+            layers.append(nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, kernel_size=kernel, padding=kernel//2),
+                nn.BatchNorm1d(out_ch),
+                act,
+                nn.Dropout(dropout),
+            ))
+            in_ch = out_ch
+        self.convs = nn.ModuleList(layers)
+
+    def forward(self, x):  # x: [B, T, n_mels]
+        x = x.transpose(1, 2)  # [B, n_mels, T]
+        for conv in self.convs:
+            x = conv(x)
+        return x.transpose(1, 2)  # [B, T, n_mels]  (residual added outside)
+
+
+class TacotronTTS(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        enc_out_dim = 2 * ENC_HIDDEN  # bidirectional
+
+        self.encoder  = Encoder(vocab_size, EMBED_DIM, ENC_HIDDEN)
+        self.prenet   = Prenet(N_MELS, sizes=(PRENET_DIM, PRENET_DIM))
+        self.attention_rnn = nn.LSTMCell(PRENET_DIM + enc_out_dim, DEC_HIDDEN)
+        self.attention     = LocationSensitiveAttention(enc_out_dim, DEC_HIDDEN, ATTN_DIM)
+        self.decoder_rnn   = nn.LSTMCell(DEC_HIDDEN + enc_out_dim, DEC_HIDDEN)
+        self.mel_proj      = nn.Linear(DEC_HIDDEN + enc_out_dim, N_MELS * REDUCTION_FACTOR)
+        self.stop_proj     = nn.Linear(DEC_HIDDEN + enc_out_dim, 1)
+        self.postnet       = Postnet(N_MELS, POSTNET_CHANNELS, POSTNET_KERNEL)
+
+    def _init_states(self, B, T_enc, memory, device):
+        h_att = torch.zeros(B, DEC_HIDDEN, device=device)
+        c_att = torch.zeros(B, DEC_HIDDEN, device=device)
+        h_dec = torch.zeros(B, DEC_HIDDEN, device=device)
+        c_dec = torch.zeros(B, DEC_HIDDEN, device=device)
+        attn_w     = torch.zeros(B, T_enc, device=device)
+        attn_w_cum = torch.zeros(B, T_enc, device=device)
+        enc_out_dim = memory.size(2)
+        context     = torch.zeros(B, enc_out_dim, device=device)
+        return h_att, c_att, h_dec, c_dec, attn_w, attn_w_cum, context
+
+    def forward(
+        self, text_ids, text_lens,
+        target_mels=None,
+        teacher_forcing_ratio=1.0,
+        max_decoder_steps=900,
+        stop_threshold=0.55,
+        min_decoder_steps=50,
+    ):
+        """
+        text_ids:   [B, T_text]  long
+        text_lens:  [B]          long
+        target_mels:[B, T_mel, N_MELS]  float  (None at inference)
+        Returns: mel_pred, mel_post, stop_logits, attn
+        """
+        B      = text_ids.size(0)
+        device = text_ids.device
+
+        # Encoder
+        memory            = self.encoder(text_ids, text_lens)  # [B, T_enc, enc_out_dim]
+        processed_memory  = self.attention.memory_layer(memory)  # [B, T_enc, attn_dim]
+        T_enc             = memory.size(1)
+
+        # Attention mask (True = keep)
+        mask = (torch.arange(T_enc, device=device).unsqueeze(0) < text_lens.unsqueeze(1))  # [B, T_enc]
+
+        h_att, c_att, h_dec, c_dec, attn_w, attn_w_cum, context = \
+            self._init_states(B, T_enc, memory, device)
+
+        # Determine number of decoder steps
+        if target_mels is not None:
+            T_mel    = target_mels.size(1)
+            n_steps  = T_mel // REDUCTION_FACTOR
+        else:
+            n_steps  = max_decoder_steps
+
+        mel_outputs  = []
+        stop_outputs = []
+        attn_outputs = []
+
+        # First decoder input = zero frame
+        dec_input = torch.zeros(B, N_MELS, device=device)
+
+        for step in range(n_steps):
+            # Prenet
+            prenet_out = self.prenet(dec_input)  # [B, PRENET_DIM]
+
+            # Attention RNN
+            attn_rnn_input  = torch.cat([prenet_out, context], dim=-1)
+            h_att, c_att    = self.attention_rnn(attn_rnn_input, (h_att, c_att))
+
+            # Location attention
+            attn_cat        = torch.stack([attn_w, attn_w_cum], dim=1)  # [B, 2, T_enc]
+            attn_w, context = self.attention(h_att, memory, processed_memory, attn_cat, mask)
+            attn_w_cum      = attn_w_cum + attn_w
+
+            # Decoder RNN
+            dec_rnn_input = torch.cat([h_att, context], dim=-1)
+            h_dec, c_dec  = self.decoder_rnn(dec_rnn_input, (h_dec, c_dec))
+
+            # Project to mel + stop
+            dec_out    = torch.cat([h_dec, context], dim=-1)
+            mel_frame  = self.mel_proj(dec_out)      # [B, N_MELS * RF]
+            stop_logit = self.stop_proj(dec_out)     # [B, 1]
+
+            # Reshape mel output: take the last frame of the RF frames as next input
+            mel_frame  = mel_frame.view(B, REDUCTION_FACTOR, N_MELS)  # [B, RF, N_MELS]
+
+            mel_outputs.append(mel_frame)
+            stop_outputs.append(stop_logit.squeeze(-1))  # [B]
+            attn_outputs.append(attn_w)
+
+            # Decide next decoder input
+            if target_mels is not None:
+                # Teacher forcing: use ground truth with probability
+                if random.random() < teacher_forcing_ratio:
+                    frame_idx  = min((step + 1) * REDUCTION_FACTOR - 1, T_mel - 1)
+                    dec_input  = target_mels[:, frame_idx, :]
+                else:
+                    dec_input = mel_frame[:, -1, :]  # last frame of prediction
+            else:
+                # Inference: use predicted frame
+                dec_input = mel_frame[:, -1, :]
+                # Early stop check (only after min steps)
+                if step >= min_decoder_steps:
+                    stop_prob = torch.sigmoid(stop_logit.squeeze(-1))
+                    if (stop_prob > stop_threshold).all():
+                        break
+
+        # Stack outputs
+        # mel_outputs: list of [B, RF, N_MELS]
+        mel_pred   = torch.cat(mel_outputs, dim=1)   # [B, T_dec_total, N_MELS]
+        stop_logits = torch.stack(stop_outputs, dim=1)  # [B, n_steps]
+        attn        = torch.stack(attn_outputs, dim=1)  # [B, n_steps, T_enc]
+
+        mel_post = mel_pred + self.postnet(mel_pred)
+
+        return mel_pred, mel_post, stop_logits, attn
+
+
+# Build model
+model = TacotronTTS(vocab_size=VOCAB_SIZE)
+
+# Use DataParallel if multiple GPUs available
+if n_gpus > 1:
+    print(f'Using DataParallel across {n_gpus} GPUs')
+    model = nn.DataParallel(model)
+
+model = model.to(device)
+
+n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f'Trainable parameters: {n_params:,}')
+
+
+# # CELL 10 — Optimizer, scheduler, AMP scaler
+# 
+
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=LR,
+    weight_decay=WEIGHT_DECAY,
+    betas=(0.9, 0.999),
+)
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5,
+    patience=4,          # was 1 in prev notebooks — too aggressive
+    min_lr=LR_MIN,
+)
+
+scaler = torch.amp.GradScaler('cuda', enabled=USE_AMP)
+
+print('Optimizer: AdamW  lr=', LR)
+print('Scheduler: ReduceLROnPlateau  patience=4  factor=0.5')
+
+
+# # CELL 11 — Loss functions and schedules
+# 
+
+
+def make_mask(lengths, max_len):
+    """Returns bool mask [B, T], True where valid."""
+    return torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+
+def masked_l1(pred, target, lengths):
+    """pred, target: [B, T, C]  lengths: [B]."""
+    T   = min(pred.size(1), target.size(1))
+    pred   = pred[:, :T]
+    target = target[:, :T]
+    lengths = lengths.clamp(max=T)
+    mask   = make_mask(lengths, T).unsqueeze(-1).float()  # [B, T, 1]
+    loss   = (pred - target).abs() * mask
+    return loss.sum() / (mask.sum() * pred.size(-1) + 1e-8)
+
+def masked_bce_stop(stop_logits, stop_targets, mel_lens):
+    """stop_logits, stop_targets: [B, T_reduced]."""
+    reduced_lens = torch.ceil(mel_lens.float() / REDUCTION_FACTOR).long()
+    T     = stop_logits.size(1)
+    reduced_lens = reduced_lens.clamp(max=T)
+    mask  = make_mask(reduced_lens, T).float()
+    pos_w = torch.tensor(STOP_POS_WEIGHT, device=stop_logits.device)
+    loss  = F.binary_cross_entropy_with_logits(
+        stop_logits, stop_targets[:, :T],
+        reduction='none',
+        pos_weight=pos_w,
+    ) * mask
+    return loss.sum() / (mask.sum() + 1e-8)
+
+def guided_attention_loss(attn, input_lens, mel_lens, g=GA_G):
+    """attn: [B, T_dec_reduced, T_enc]."""
+    B, T_dec_r, T_enc_max = attn.shape
+    total, count = 0.0, 0
+    for b in range(B):
+        Td = min(T_dec_r, math.ceil(mel_lens[b].item() / REDUCTION_FACTOR))
+        Te = min(T_enc_max, input_lens[b].item())
+        if Td <= 1 or Te <= 1:
+            continue
+        t = torch.arange(Td, device=attn.device, dtype=torch.float32).unsqueeze(1) / Td
+        n = torch.arange(Te, device=attn.device, dtype=torch.float32).unsqueeze(0) / Te
+        W = 1.0 - torch.exp(-((n - t) ** 2) / (2 * g * g))
+        total += (attn[b, :Td, :Te] * W).mean()
+        count += 1
+    return total / count if count > 0 else attn.sum() * 0
+
+
+def get_teacher_forcing(epoch, total):
+    hold_until = int(total * TF_HOLD_FRAC)
+    if epoch <= hold_until:
+        return TF_START
+    alpha = (epoch - hold_until) / max(total - hold_until, 1)
+    return TF_START + alpha * (TF_END - TF_START)
+
+
+def get_guided_lambda(epoch, total):
+    hold_until = int(total * GA_HOLD_FRAC)
+    if epoch <= hold_until:
+        return GA_MAX
+    alpha = (epoch - hold_until) / max(total - hold_until, 1)
+    return GA_MAX + alpha * (GA_MIN - GA_MAX)
+
+
+def attn_diag_score(attn, input_lens, mel_lens):
+    """Measures how diagonal the attention is. 1.0 = perfect diagonal."""
+    B, T_dec_r, T_enc_max = attn.shape
+    scores = []
+    for b in range(min(B, 4)):
+        Td = min(T_dec_r, math.ceil(mel_lens[b].item() / REDUCTION_FACTOR))
+        Te = min(T_enc_max, input_lens[b].item())
+        if Td <= 1 or Te <= 1:
+            continue
+        t = torch.arange(Td, device=attn.device, dtype=torch.float32) / Td
+        n = torch.argmax(attn[b, :Td, :Te], dim=1).float() / Te
+        scores.append(1.0 - (n - t).abs().mean().item())
+    return float(np.mean(scores)) if scores else 0.0
+
+
+print('Losses and schedules ready.')
+# Show schedule preview
+for ep in [1, 50, 100, 150, 200, 250]:
+    print(f'  Epoch {ep:3d}: TF={get_teacher_forcing(ep, EPOCHS):.2f}  GA_lambda={get_guided_lambda(ep, EPOCHS):.3f}')
+
+
+# # CELL 12 — Checkpoint helpers
+# 
+
+
+def save_ckpt(path, epoch, best_val, history):
+    # Handle DataParallel wrapper
+    m = model.module if isinstance(model, nn.DataParallel) else model
+    torch.save({
+        'epoch':      epoch,
+        'model':      m.state_dict(),
+        'optimizer':  optimizer.state_dict(),
+        'scheduler':  scheduler.state_dict(),
+        'scaler':     scaler.state_dict(),
+        'best_val':   best_val,
+        'history':    history,
+        'vocab':      vocab,
+        'stoi':       stoi,
+    }, path)
+
+
+def load_ckpt(path):
+    ckpt = torch.load(path, map_location=device)
+    m = model.module if isinstance(model, nn.DataParallel) else model
+    m.load_state_dict(ckpt['model'])
+    optimizer.load_state_dict(ckpt['optimizer'])
+    scheduler.load_state_dict(ckpt['scheduler'])
+    scaler.load_state_dict(ckpt['scaler'])
+    return ckpt['epoch'], ckpt['best_val'], ckpt.get('history', {})
+
+
+# Resume from checkpoint if one exists
+start_epoch = 1
+best_val    = float('inf')
+history     = {'train': [], 'val': [], 'diag': [], 'lr': []}
+no_improve  = 0
+
+if LATEST_CKPT.exists():
+    print('Found existing checkpoint — resuming...')
+    start_epoch, best_val, history = load_ckpt(LATEST_CKPT)
+    start_epoch += 1
+    no_improve   = 0  # reset patience on resume (conservative)
+    print(f'Resumed from epoch {start_epoch - 1}  best_val={best_val:.4f}')
+else:
+    print('No checkpoint found — starting fresh.')
+
+
+# # CELL 13 — Inference helper
+# 
+
+
+@torch.no_grad()
+def synthesize(text: str, out_wav_path: str = None) -> dict:
+    """Convert text to audio. Returns dict with mel, audio, attn."""
+    m = model.module if isinstance(model, nn.DataParallel) else model
+    m.eval()
+
+    ids     = torch.tensor([text_to_ids(text)], dtype=torch.long, device=device)
+    lengths = torch.tensor([ids.size(1)], dtype=torch.long, device=device)
+
+    with torch.amp.autocast('cuda', enabled=USE_AMP):
+        _, mel_post, _, attn = m(
+            ids, lengths,
+            target_mels=None,
+            teacher_forcing_ratio=0.0,
+            max_decoder_steps=INFER_MAX_STEPS,
+            stop_threshold=INFER_STOP_THRESHOLD,
+            min_decoder_steps=INFER_MIN_STEPS,
+        )
+
+    mel   = mel_post[0].float().cpu().numpy()   # [T, 80]
+    audio = log_mel_to_audio(mel, n_iter=80)
+
+    if out_wav_path:
+        sf.write(out_wav_path, audio, SAMPLE_RATE)
+
+    return {
+        'mel':   mel,
+        'audio': audio,
+        'attn':  attn[0].float().cpu().numpy(),
+    }
+
+
+def save_plots(epoch, history):
+    """Save training curve and attention plot."""
+    if len(history['train']) < 2:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    ep = list(range(1, len(history['train']) + 1))
+
+    axes[0].plot(ep, history['train'], label='Train')
+    axes[0].plot(ep, history['val'],   label='Val')
+    axes[0].set_title('Loss')
+    axes[0].legend()
+    axes[0].grid(True)
+
+    if history['diag']:
+        axes[1].plot(ep, history['diag'], color='green')
+        axes[1].axhline(y=0.6, color='red', linestyle='--', label='Target ≥ 0.6')
+        axes[1].set_title('Attention Diagonal Score (higher = better alignment)')
+        axes[1].set_ylim(0, 1)
+        axes[1].legend()
+        axes[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(PLOT_DIR / f'progress_epoch{epoch:03d}.png', dpi=80)
+    plt.close()
+
+
+print('Inference helper ready.')
+
+
+# # CELL 14 — Training loop
+# 
+
+
+SAMPLE_TEXT = args.sample_text
+
+
+@torch.no_grad()
+def run_validation(epoch):
+    model.eval()
+    total_loss = 0.0
+    total_items = 0
+    last_attn = last_il = last_ml = None
+
+    for ids, il, mels, ml, stop_t, _ in val_loader:
+        ids    = ids.to(device)
+        il     = il.to(device)
+        mels   = mels.to(device)
+        ml_d   = ml.to(device)
+        stop_t = stop_t.to(device)
+
+        with torch.amp.autocast('cuda', enabled=USE_AMP):
+            mel_pred, mel_post, stop_logits, attn = model(
+                ids, il, target_mels=mels, teacher_forcing_ratio=1.0
+            )
+            mel_loss   = masked_l1(mel_pred, mels, ml_d) + masked_l1(mel_post, mels, ml_d)
+            stop_loss  = masked_bce_stop(stop_logits, stop_t, ml_d)
+            attn_loss  = guided_attention_loss(attn, il, ml_d)
+            loss       = mel_loss + stop_loss + get_guided_lambda(epoch, EPOCHS) * attn_loss
+
+        total_loss  += loss.item() * ids.size(0)
+        total_items += ids.size(0)
+        last_attn, last_il, last_ml = attn, il, ml_d
+
+    diag = attn_diag_score(last_attn, last_il, last_ml) if last_attn is not None else 0.0
+    return total_loss / max(total_items, 1), diag
+
+
+print(f'Starting training from epoch {start_epoch} to {EPOCHS}')
+print(f'Steps per epoch: {len(train_loader)}')
+print()
+
+for epoch in range(start_epoch, EPOCHS + 1):
+    model.train()
+    tf_ratio  = get_teacher_forcing(epoch, EPOCHS)
+    ga_lambda = get_guided_lambda(epoch, EPOCHS)
+
+    train_loss  = 0.0
+    total_items = 0
+    t0 = time.time()
+
+    for ids, il, mels, ml, stop_t, _ in train_loader:
+        ids    = ids.to(device, non_blocking=True)
+        il     = il.to(device, non_blocking=True)
+        mels   = mels.to(device, non_blocking=True)
+        ml_d   = ml.to(device, non_blocking=True)
+        stop_t = stop_t.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast('cuda', enabled=USE_AMP):
+            mel_pred, mel_post, stop_logits, attn = model(
+                ids, il, target_mels=mels,
+                teacher_forcing_ratio=tf_ratio,
+            )
+            mel_loss  = masked_l1(mel_pred, mels, ml_d) + masked_l1(mel_post, mels, ml_d)
+            stop_loss = masked_bce_stop(stop_logits, stop_t, ml_d)
+            attn_loss = guided_attention_loss(attn, il, ml_d)
+            loss      = mel_loss + stop_loss + ga_lambda * attn_loss
+
+        if not torch.isfinite(loss):
+            continue  # skip NaN batches
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+
+        train_loss  += loss.item() * ids.size(0)
+        total_items += ids.size(0)
+
+    train_loss /= max(total_items, 1)
+    val_loss, diag = run_validation(epoch)
+    scheduler.step(val_loss)
+
+    current_lr = optimizer.param_groups[0]['lr']
+    elapsed    = time.time() - t0
+
+    history['train'].append(train_loss)
+    history['val'].append(val_loss)
+    history['diag'].append(diag)
+    history['lr'].append(current_lr)
+
+    print(
+        f'Epoch {epoch:3d}/{EPOCHS} | '
+        f'Train={train_loss:.4f} Val={val_loss:.4f} | '
+        f'DiagScore={diag:.3f} | '
+        f'TF={tf_ratio:.2f} GA={ga_lambda:.3f} | '
+        f'LR={current_lr:.1e} | '
+        f'{elapsed:.0f}s'
+    )
+
+    save_ckpt(LATEST_CKPT, epoch, best_val, history)
+
+    if val_loss < best_val:
+        best_val   = val_loss
+        no_improve = 0
+        save_ckpt(BEST_CKPT, epoch, best_val, history)
+        print(f'  ✓ New best val loss: {best_val:.4f}')
+    else:
+        no_improve += 1
+        if no_improve >= EARLY_STOPPING_PATIENCE:
+            print(f'  Early stopping: {no_improve} epochs without improvement.')
+            break
+
+    # Save audio sample every 10 epochs
+    if epoch % 10 == 0 or epoch == 1:
+        try:
+            sample_path = str(SAMPLE_DIR / f'epoch_{epoch:03d}.wav')
+            synthesize(SAMPLE_TEXT, out_wav_path=sample_path)
+            print(f'  Audio sample saved: {sample_path}')
+        except Exception as e:
+            print(f'  Sample synthesis failed: {e}')
+        save_plots(epoch, history)
+
+print('\nTraining complete!')
+
+
+# # CELL 15 — Load best checkpoint and generate final audio
+# 
+
+
+if BEST_CKPT.exists():
+    load_ckpt(BEST_CKPT)
+    print(f'Loaded best checkpoint: {BEST_CKPT}')
+else:
+    print('Best checkpoint not found — using current weights.')
+
+# Generate the final demo
+FINAL_TEXT = args.sample_text
+FINAL_WAV  = str(WORK_DIR / 'final_demo.wav')
+
+result = synthesize(FINAL_TEXT, out_wav_path=FINAL_WAV)
+
+print(f'Saved: {FINAL_WAV}')
+print(f'Mel shape: {result["mel"].shape}')
+print(f'Audio duration: {len(result["audio"]) / SAMPLE_RATE:.2f} sec')
+
+# Play in Kaggle notebook
+print(f'Final demo ready: {FINAL_WAV}')
+
+
+# # CELL 16 — Plot attention and mel spectrogram
+# 
+
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+attn = result['attn']  # [T_dec, T_enc]
+axes[0].imshow(attn, aspect='auto', origin='lower', interpolation='none')
+axes[0].set_title('Attention Alignment')
+axes[0].set_xlabel('Encoder steps (characters)')
+axes[0].set_ylabel('Decoder steps')
+
+mel = result['mel'].T  # [80, T]
+axes[1].imshow(mel, aspect='auto', origin='lower', interpolation='none')
+axes[1].set_title('Predicted Mel Spectrogram')
+axes[1].set_xlabel('Time')
+axes[1].set_ylabel('Mel bins')
+
+plt.tight_layout()
+plt.savefig(str(WORK_DIR / 'final_plots.png'), dpi=100)
+plt.close()
+print('Plots saved to', WORK_DIR / 'final_plots.png')
+
+
+# # CELL 17 — Try any text
+# 
+
+
+# Change this to whatever you want!
+MY_TEXT = 'The quick brown fox jumps over the lazy dog.'
+
+out = synthesize(MY_TEXT, out_wav_path=str(WORK_DIR / 'custom_output.wav'))
+print(f'Text: {MY_TEXT}')
+print(f'Audio duration: {len(out["audio"]) / SAMPLE_RATE:.2f} sec')
+print('Custom audio saved to', WORK_DIR / 'custom_output.wav')
+
+
+# # CELL 18 — Training curve summary
+# 
+
+
+if len(history['train']) > 1:
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+
+    ep = list(range(1, len(history['train']) + 1))
+
+    axes[0].plot(ep, history['train'], label='Train')
+    axes[0].plot(ep, history['val'],   label='Val')
+    axes[0].set_title('Total Loss')
+    axes[0].set_xlabel('Epoch')
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].plot(ep, history['diag'], color='green')
+    axes[1].axhline(y=0.5, color='orange', linestyle='--', label='0.5 threshold')
+    axes[1].axhline(y=0.7, color='red',    linestyle='--', label='0.7 threshold')
+    axes[1].set_title('Attention Diagonal Score')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylim(0, 1)
+    axes[1].legend()
+    axes[1].grid(True)
+
+    axes[2].plot(ep, history['lr'])
+    axes[2].set_title('Learning Rate')
+    axes[2].set_xlabel('Epoch')
+    axes[2].set_yscale('log')
+    axes[2].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(str(WORK_DIR / 'training_summary.png'), dpi=100)
+    plt.close()
+    print('Summary plot saved.')
+

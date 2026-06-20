@@ -1,0 +1,650 @@
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Dict
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ===============================
+# Page Header
+# ===============================
+
+st.title("🎥 Live Sign Translation")
+st.caption("Integrated live sign → text → age/gender-aware speech + speech → text for two-way communication")
+
+user = st.session_state.get("user", {}) or {}
+profile_age = user.get("age")
+profile_gender = user.get("gender")
+
+st.info(
+    "This page keeps Mohamed's live settings: chunk recording, candidate stability, "
+    "hand-release confirmation, sentence building, and TTS playback."
+)
+
+with st.expander("Run instructions", expanded=False):
+    st.markdown("Start the live API in another terminal before using camera/TTS:")
+    st.code(
+        "conda activate grad_py310\n"
+        "cd <your_inner_project_folder>\n"
+        "python sign_live_api.py",
+        language="powershell",
+    )
+
+c1, c2 = st.columns(2)
+with c1:
+    live_endpoint = st.text_input(
+        "Live sign endpoint",
+        value="http://127.0.0.1:8000/api/sign-v2/single",
+    )
+with c2:
+    tts_endpoint = st.text_input(
+        "TTS endpoint",
+        value="http://127.0.0.1:8000/api/tts",
+    )
+
+use_release_confirm = st.checkbox(
+    "Use hand disappearance / release-to-confirm",
+    value=True,
+)
+
+with st.expander("Live tuning settings", expanded=False):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        live_chunk_ms = st.number_input("Chunk duration ms", 500, 2500, 1000, 50)
+        live_loop_gap_ms = st.number_input("Loop gap ms", 20, 1000, 200, 10)
+        live_no_hand_gap_ms = st.number_input("No-hand gap ms", 100, 1500, 500, 50)
+    with c2:
+        live_after_accept_gap_ms = st.number_input("After-accept gap ms", 100, 1500, 600, 50)
+        live_min_confidence = st.slider("Minimum candidate confidence", 0.01, 0.90, 0.30, 0.01)
+        live_release_confirm_confidence = st.slider("Release confirm confidence", 0.01, 0.90, 0.15, 0.01)
+    with c3:
+        live_hold_confirm_confidence = st.slider("Hold confirm confidence", 0.01, 0.99, 0.62, 0.01)
+        live_stable_count_required = st.number_input("Stable count required", 1, 5, 1, 1)
+        live_repeat_cooldown_ms = st.number_input("Repeat cooldown ms", 500, 6000, 2500, 100)
+
+# Values injected into browser-side JS.
+CONFIG: Dict[str, Any] = {
+    "liveEndpoint": live_endpoint,
+    "ttsEndpoint": tts_endpoint,
+    "profileGender": profile_gender,
+    "profileAge": profile_age,
+    "useReleaseConfirm": bool(use_release_confirm),
+    "chunkMs": int(live_chunk_ms),
+    "loopGapMs": int(live_loop_gap_ms),
+    "noHandGapMs": int(live_no_hand_gap_ms),
+    "afterAcceptGapMs": int(live_after_accept_gap_ms),
+    "minConfidence": float(live_min_confidence),
+    "releaseConfirmConfidence": float(live_release_confirm_confidence),
+    "holdConfirmConfidence": float(live_hold_confirm_confidence),
+    "stableCountRequired": int(live_stable_count_required),
+    "repeatCooldownMs": int(live_repeat_cooldown_ms),
+}
+
+html = r'''
+<div class="ishara-live-root">
+  <style>
+    .ishara-live-root * { box-sizing: border-box; }
+    .ishara-live-root { font-family: Arial, Helvetica, sans-serif; color: #0f172a; }
+    .live-grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 18px; align-items: start; }
+    .panel { border: 1px solid #e5e7eb; border-radius: 18px; padding: 18px; background: #fff; }
+    #livePreview { width: 100%; height: 360px; background: #000; border-radius: 16px; object-fit: cover; }
+    .buttons { display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }
+    button { border:0; background:#0f766e; color:#fff; padding: 11px 16px; border-radius: 11px; cursor:pointer; font-weight: 800; }
+    button:hover { background:#115e59; }
+    button:disabled { background:#9ca3af; cursor:not-allowed; }
+    .status { margin-top: 14px; background:#f3f4f6; padding: 13px; border-radius: 13px; font-weight: 800; }
+    .mini { background:#f8fafc; border:1px solid #e5e7eb; border-radius: 16px; padding: 16px; margin-bottom:14px; }
+    .mini h3 { margin:0 0 8px; font-size: 17px; }
+    .word { font-size: 36px; font-weight: 900; color:#0f766e; letter-spacing:.5px; }
+    .sentence { font-size: 22px; font-weight: 800; line-height:1.4; }
+    .muted { color:#64748b; font-size: 14px; }
+    pre { background:#111827; color:#d1fae5; padding:12px; border-radius:12px; max-height:260px; overflow:auto; font-size:12px; }
+    .audio { display:none; width:100%; margin-top: 10px; }
+    @media(max-width:900px){ .live-grid{grid-template-columns:1fr;} #livePreview{height:300px;} }
+  </style>
+
+  <div class="live-grid">
+    <div class="panel">
+      <video id="livePreview" autoplay muted playsinline></video>
+      <div class="buttons">
+        <button onclick="openLiveTranslator()">Open Camera</button>
+        <button onclick="startLiveTranslation()" id="liveStartBtn" disabled>Start Live</button>
+        <button onclick="stopLiveTranslation()" id="liveStopBtn" disabled>Stop</button>
+        <button onclick="clearLiveSentence()">Clear Sentence</button>
+        <button onclick="speakLiveSentence()">Speak Sentence</button>
+        <button onclick="closeLiveCamera()">Close Camera</button>
+      </div>
+      <div id="liveStatus" class="status">Camera is closed.</div>
+    </div>
+
+    <div class="panel">
+      <div class="mini">
+        <h3>Current Prediction</h3>
+        <div id="liveCurrentWord" class="word">---</div>
+        <div id="liveConfidence" class="muted">Confidence: ---</div>
+      </div>
+      <div class="mini">
+        <h3>Gloss Sequence</h3>
+        <div id="liveGlossSequence" class="sentence">---</div>
+      </div>
+      <div class="mini">
+        <h3>Live English Sentence</h3>
+        <div id="liveEnglishSentence" class="sentence">---</div>
+        <audio id="liveTtsAudio" class="audio" controls></audio>
+        <div id="liveTtsMeta" class="muted"></div>
+      </div>
+      <details>
+        <summary><b>Raw Live Result</b></summary>
+        <pre id="liveRawResult">---</pre>
+      </details>
+    </div>
+  </div>
+</div>
+
+<script>
+const CONFIG = __CONFIG__;
+const LIVE_ENDPOINT = CONFIG.liveEndpoint;
+const TTS_ENDPOINT = CONFIG.ttsEndpoint;
+const PROFILE_GENDER = CONFIG.profileGender || '';
+const PROFILE_AGE = CONFIG.profileAge || '';
+const USE_RELEASE_CONFIRM = !!CONFIG.useReleaseConfirm;
+
+const LIVE_CHUNK_MS = CONFIG.chunkMs;
+const LIVE_LOOP_GAP_MS = CONFIG.loopGapMs;
+const LIVE_NO_HAND_GAP_MS = CONFIG.noHandGapMs;
+const LIVE_AFTER_ACCEPT_GAP_MS = CONFIG.afterAcceptGapMs;
+const LIVE_MIN_CONFIDENCE = CONFIG.minConfidence;
+const LIVE_RELEASE_CONFIRM_CONFIDENCE = CONFIG.releaseConfirmConfidence;
+const LIVE_HOLD_CONFIRM_CONFIDENCE = CONFIG.holdConfirmConfidence;
+const LIVE_STABLE_COUNT_REQUIRED = CONFIG.stableCountRequired;
+const LIVE_REPEAT_COOLDOWN_MS = CONFIG.repeatCooldownMs;
+
+let liveStream = null;
+let liveIsRunning = false;
+let liveIsProcessing = false;
+let liveGlosses = [];
+let liveWords = [];
+let liveLastAcceptedGloss = '';
+let liveLastAcceptedTime = 0;
+let liveCandidateGloss = '';
+let liveCandidateCount = 0;
+let liveCandidatePred = null;
+let liveLoopTimer = null;
+
+function liveSetText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text || '---';
+}
+function liveSetJSON(id, data) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+}
+function liveSetButton(id, disabled) {
+  const btn = document.getElementById(id);
+  if (btn) btn.disabled = disabled;
+}
+function liveSetAudio(id, url) {
+  const audio = document.getElementById(id);
+  if (!audio) return;
+  if (url) {
+    audio.src = url;
+    audio.style.display = 'block';
+    audio.load();
+  } else {
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.style.display = 'none';
+  }
+}
+
+function liveGetBrowserCameraStream(constraints) {
+  if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function') {
+    return navigator.mediaDevices.getUserMedia(constraints);
+  }
+  const old = navigator.webkitGetUserMedia || navigator.mozGetUserMedia || navigator.msGetUserMedia;
+  if (typeof old === 'function') {
+    return new Promise((resolve, reject) => old.call(navigator, constraints, resolve, reject));
+  }
+  return Promise.reject(new Error('Camera API is not supported. Open Streamlit using localhost or 127.0.0.1.'));
+}
+
+async function openLiveTranslator() {
+  const preview = document.getElementById('livePreview');
+  liveSetText('liveStatus', 'Opening camera...');
+  try {
+    let constraints = { video: { width:{ideal:480}, height:{ideal:360}, frameRate:{ideal:12, max:15}, facingMode:'user' }, audio:false };
+    try { liveStream = await liveGetBrowserCameraStream(constraints); }
+    catch(e) { liveStream = await liveGetBrowserCameraStream({video:true, audio:false}); }
+    preview.srcObject = liveStream;
+    preview.muted = true;
+    preview.playsInline = true;
+    await preview.play();
+    liveSetText('liveStatus', 'Camera ready. Perform one sign clearly, then release/hide your hand to confirm.');
+    liveSetButton('liveStartBtn', false);
+    liveSetButton('liveStopBtn', true);
+  } catch(err) {
+    liveSetText('liveStatus', 'Camera error: ' + (err.message || String(err)));
+  }
+}
+
+function closeLiveCamera() {
+  stopLiveTranslation();
+  if (liveStream) liveStream.getTracks().forEach(t => t.stop());
+  liveStream = null;
+  const preview = document.getElementById('livePreview');
+  if (preview) preview.srcObject = null;
+  liveSetButton('liveStartBtn', true);
+  liveSetButton('liveStopBtn', true);
+  liveSetText('liveStatus', 'Camera is closed.');
+}
+
+function liveGetRecorderOptions() {
+  if (typeof MediaRecorder === 'undefined') return null;
+  if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) return {mimeType:'video/webm;codecs=vp8'};
+  if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) return {mimeType:'video/webm;codecs=vp9'};
+  if (MediaRecorder.isTypeSupported('video/webm')) return {mimeType:'video/webm'};
+  return {};
+}
+
+function recordLiveChunk(stream, durationMs) {
+  return new Promise((resolve, reject) => {
+    if (!stream) { reject(new Error('Camera stream is not available.')); return; }
+    if (typeof MediaRecorder === 'undefined') { reject(new Error('MediaRecorder is not supported. Use Chrome or Edge.')); return; }
+    const options = liveGetRecorderOptions();
+    if (options === null) { reject(new Error('MediaRecorder is not supported.')); return; }
+    let recorder;
+    try { recorder = new MediaRecorder(stream, options); } catch(err) { reject(err); return; }
+    const chunks = [];
+    recorder.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+    recorder.onerror = e => reject(e.error || new Error('MediaRecorder error'));
+    recorder.onstop = () => resolve(new Blob(chunks, { type: recorder.mimeType || 'video/webm' }));
+    recorder.start(80);
+    setTimeout(() => { if (recorder.state !== 'inactive') recorder.stop(); }, durationMs);
+  });
+}
+
+async function sendLiveChunkToBackend(blob) {
+  const fd = new FormData();
+  const file = new File([blob], 'live_sign_' + Date.now() + '.webm', { type: blob.type || 'video/webm' });
+  fd.append('video', file);
+  fd.append('top_k', '5');
+  fd.append('check_hand', USE_RELEASE_CONFIRM ? 'true' : 'false');
+  const response = await fetch(LIVE_ENDPOINT, { method:'POST', body:fd });
+  return await response.json();
+}
+
+function normalizeGloss(gloss) { return String(gloss || '').trim().toUpperCase(); }
+function cleanDisplayWord(word) { return String(word || '').trim().replace(/_/g, ' ').replace(/\s+/g, ' '); }
+
+function extractPrediction(data) {
+  if (!data || !data.ok || !data.result) return null;
+  const r = data.result;
+  let gloss = r.gloss || r.label || r.predicted_label || '';
+  let text = r.text || r.clean_text || r.word || r.predicted_text || '';
+  let confidence = r.confidence || r.probability || r.score || null;
+  if ((!gloss || confidence === null) && r.top_k && r.top_k.length > 0) {
+    const t = r.top_k[0];
+    if (!gloss) gloss = t.gloss || t.label || '';
+    if (!text) text = t.text || t.word || t.gloss || '';
+    if (confidence === null || confidence === undefined) confidence = t.confidence || t.probability || t.score || 0;
+  }
+  gloss = normalizeGloss(gloss);
+  text = cleanDisplayWord(text || gloss);
+  confidence = Number(confidence || 0);
+  if (!gloss && text) gloss = normalizeGloss(text);
+  if (!gloss) return null;
+  return {gloss, text, confidence, raw:r};
+}
+
+const GLOSS_TO_WORD = {
+  'MYSELF':'I','WANT1':'want','WANT':'want','EAT1':'eat','EAT':'eat','BREAKFAST1':'breakfast','BREAKFAST':'breakfast',
+  'LUNCH1':'lunch','LUNCH':'lunch','DINNER1':'dinner','DINNER':'dinner','APPLE':'apple','CANDY2':'candy','CANDY':'candy',
+  'MEAT1':'meat','MEAT':'meat','TOMATO':'tomato','HOSPITAL1':'hospital','HOSPITAL':'hospital','BANDAGE':'bandage',
+  'FINE1':'fine','FINE':'fine','CONFUSED1':'confused','CONFUSED':'confused','SHOCKED':'shocked','BABY2':'baby','BABY':'baby',
+  'PATIENT2':'patient','PATIENT':'patient','DEAF1':'deaf','DEAF':'deaf','HARDOFHEARING':'hard of hearing','VOICE':'voice',
+  'HOUSE':'home','ADDRESS':'address','BACKPACK1':'backpack','BACKPACK':'backpack','JACKET3':'jacket','JACKET':'jacket',
+  'SCARF2':'scarf','SCARF':'scarf','SWEATER2':'sweater','SWEATER':'sweater','BELT1':'belt','BELT':'belt',
+  'JEWELRY':'jewelry','STOP':'stop','CLOSE':'close','MOVIE1':'movie','MOVIE':'movie','NIGHT1':'night','NIGHT':'night',
+  'PARTY1':'party','PARTY':'party','THEY1':'they','THEY':'they','TYPE1':'type','TYPE':'type','EDIT1':'edit','EDIT':'edit',
+  'RESEARCH1':'research','RESEARCH':'research','TEACH1':'teach','TEACH':'teach','UNDERGRADUATE':'undergraduates'
+};
+const EXACT_SENTENCE_MAP = {
+  'MYSELF WANT1 BREAKFAST1':'I want breakfast.','MYSELF WANT1 LUNCH1':'I want lunch.','MYSELF WANT1 DINNER1':'I want dinner.',
+  'MYSELF WANT1 APPLE':'I want an apple.','MYSELF WANT1 CANDY2':'I want candy.','MYSELF EAT1 APPLE':'I eat apple.',
+  'MYSELF EAT1 MEAT1':'I eat meat.','MYSELF EAT1 TOMATO':'I eat tomato.','MYSELF EAT1 LUNCH1':'I eat lunch.',
+  'MYSELF EAT1 DINNER1':'I eat dinner.','MYSELF WANT1 HOSPITAL1':'I need hospital.','MYSELF WANT1 BANDAGE':'I need a bandage.',
+  'MYSELF FINE1':'I am fine.','MYSELF CONFUSED1':'I am confused.','MYSELF SHOCKED':'I am shocked.',
+  'BABY2 FINE1':'The baby is fine.','PATIENT2 CONFUSED1':'The patient is confused.','THEY1 DEAF1':'They are deaf.',
+  'THEY1 HARDOFHEARING':'They are hard of hearing.','MYSELF WANT1 VOICE':'I need voice.','MYSELF WANT1 HOUSE':'I want to go home.',
+  'MYSELF WANT1 ADDRESS':'I need the address.','MYSELF WANT1 BACKPACK1':'I want my backpack.','MYSELF WANT1 JACKET3':'I want my jacket.',
+  'MYSELF WANT1 SCARF2':'I want a scarf.','MYSELF WANT1 SWEATER2':'I want a sweater.','MYSELF WANT1 BELT1':'I want a belt.',
+  'MYSELF WANT1 JEWELRY':'I want jewelry.','STOP':'Stop.','CLOSE':'Close it.','MYSELF WANT1 MOVIE1':'I want a movie.',
+  'MOVIE1 NIGHT1':'Movie night.','MYSELF WANT1 PARTY1':'I want a party.','PARTY1 NIGHT1':'Party night.',
+  'THEY1 WANT1 DINNER1':'They want dinner.','THEY1 WANT1 HOUSE':'They want to go home.','MYSELF TYPE1':'I type.',
+  'MYSELF EDIT1':'I edit.','MYSELF RESEARCH1':'I do research.','MYSELF TEACH1 UNDERGRADUATE':'I teach undergraduates.'
+};
+function canonicalGloss(gloss) {
+  gloss = normalizeGloss(gloss);
+  const aliases = {'WANT':'WANT1','EAT':'EAT1','BREAKFAST':'BREAKFAST1','LUNCH':'LUNCH1','DINNER':'DINNER1','CANDY':'CANDY2','MEAT':'MEAT1','HOSPITAL':'HOSPITAL1','FINE':'FINE1','CONFUSED':'CONFUSED1','BABY':'BABY2','PATIENT':'PATIENT2','DEAF':'DEAF1','BACKPACK':'BACKPACK1','JACKET':'JACKET3','SCARF':'SCARF2','SWEATER':'SWEATER2','BELT':'BELT1','MOVIE':'MOVIE1','NIGHT':'NIGHT1','PARTY':'PARTY1','THEY':'THEY1','TYPE':'TYPE1','EDIT':'EDIT1','RESEARCH':'RESEARCH1','TEACH':'TEACH1'};
+  return aliases[gloss] || gloss;
+}
+function capitalizeSentence(text) {
+  text = String(text || '').trim();
+  if (!text) return '---';
+  text = text.charAt(0).toUpperCase() + text.slice(1);
+  if (!/[.!?]$/.test(text)) text += '.';
+  return text;
+}
+function buildEnglishFromGlosses(glosses) {
+  if (!glosses || glosses.length === 0) return '---';
+  const canonical = glosses.map(canonicalGloss);
+  const key = canonical.join(' ');
+  if (EXACT_SENTENCE_MAP[key]) return EXACT_SENTENCE_MAP[key];
+  let sentence = canonical.map(g => GLOSS_TO_WORD[g] || g.toLowerCase()).join(' ').replace(/\s+/g, ' ').trim();
+  sentence = sentence.replace(/^I want hospital$/i,'I need hospital').replace(/^I want bandage$/i,'I need a bandage').replace(/^I want address$/i,'I need the address').replace(/^I want voice$/i,'I need voice').replace(/^I want home$/i,'I want to go home').replace(/^they want home$/i,'They want to go home').replace(/^I fine$/i,'I am fine').replace(/^I confused$/i,'I am confused').replace(/^I shocked$/i,'I am shocked').replace(/^baby fine$/i,'The baby is fine').replace(/^patient confused$/i,'The patient is confused').replace(/^they deaf$/i,'They are deaf').replace(/^they hard of hearing$/i,'They are hard of hearing').replace(/^movie night$/i,'Movie night').replace(/^party night$/i,'Party night').replace(/^I research$/i,'I do research');
+  return capitalizeSentence(sentence);
+}
+function updateLiveSentenceUI() {
+  if (liveGlosses.length === 0) { liveSetText('liveGlossSequence','---'); liveSetText('liveEnglishSentence','---'); return; }
+  liveSetText('liveGlossSequence', liveGlosses.join(' + '));
+  liveSetText('liveEnglishSentence', buildEnglishFromGlosses(liveGlosses));
+}
+function acceptPrediction(pred) {
+  const gloss = canonicalGloss(pred.gloss);
+  liveGlosses.push(gloss);
+  liveWords.push(pred.text);
+  liveLastAcceptedGloss = gloss;
+  liveLastAcceptedTime = Date.now();
+  liveCandidateGloss = '';
+  liveCandidateCount = 0;
+  liveCandidatePred = null;
+  updateLiveSentenceUI();
+}
+function acceptPendingCandidateByRelease() {
+  if (!liveCandidatePred) return false;
+  if (liveCandidatePred.confidence < LIVE_RELEASE_CONFIRM_CONFIDENCE) {
+    liveSetText('liveStatus', 'Hand disappeared, but confidence was too low: ' + liveCandidatePred.gloss);
+    liveCandidateGloss = ''; liveCandidateCount = 0; liveCandidatePred = null;
+    return false;
+  }
+  const accepted = liveCandidatePred.gloss;
+  acceptPrediction(liveCandidatePred);
+  liveSetText('liveStatus', 'Accepted by hand release: ' + accepted);
+  return true;
+}
+function shouldAcceptPrediction(pred) {
+  if (!pred || pred.confidence < LIVE_MIN_CONFIDENCE) return false;
+  const now = Date.now();
+  const currentGloss = canonicalGloss(pred.gloss);
+  const lastAcceptedGloss = canonicalGloss(liveLastAcceptedGloss);
+  const candidateGloss = canonicalGloss(liveCandidateGloss);
+  if (currentGloss === lastAcceptedGloss && now - liveLastAcceptedTime < LIVE_REPEAT_COOLDOWN_MS) {
+    liveSetText('liveStatus', 'Same accepted sign ignored: ' + currentGloss);
+    return false;
+  }
+  if (!candidateGloss) {
+    liveCandidateGloss = currentGloss; liveCandidateCount = 1; liveCandidatePred = pred;
+    liveSetText('liveStatus', 'Candidate: ' + currentGloss + ' | Release your hand to confirm');
+    return false;
+  }
+  if (currentGloss === candidateGloss) {
+    liveCandidateCount += 1;
+    if (!liveCandidatePred || pred.confidence > liveCandidatePred.confidence) liveCandidatePred = pred;
+    liveSetText('liveStatus', 'Holding: ' + currentGloss + ' | confidence ' + pred.confidence.toFixed(3) + ' | release hand to confirm');
+    if (liveCandidateCount >= LIVE_STABLE_COUNT_REQUIRED && pred.confidence >= LIVE_HOLD_CONFIRM_CONFIDENCE) return true;
+    return false;
+  }
+  liveSetText('liveStatus', 'Movement changed. Rejected: ' + candidateGloss + ' | New candidate: ' + currentGloss);
+  liveCandidateGloss = currentGloss; liveCandidateCount = 1; liveCandidatePred = pred;
+  return false;
+}
+
+async function runOneLiveCycle() {
+  if (!liveIsRunning || liveIsProcessing || !liveStream) return;
+  liveIsProcessing = true;
+  try {
+    liveSetText('liveStatus', 'Recording short chunk...');
+    const blob = await recordLiveChunk(liveStream, LIVE_CHUNK_MS);
+    if (!liveIsRunning) { liveIsProcessing = false; return; }
+    liveSetText('liveStatus', 'Processing sign...');
+    const data = await sendLiveChunkToBackend(blob);
+    const noHand = data && data.ok && data.result && (data.result.no_hand === true || data.result.hand_visible === false);
+    if (noHand) {
+      liveSetText('liveCurrentWord', '---');
+      liveSetText('liveConfidence', 'Confidence: ---');
+      liveSetJSON('liveRawResult', { ok:data.ok, no_hand:true, pending_candidate: liveCandidatePred ? {gloss:liveCandidatePred.gloss, confidence:liveCandidatePred.confidence} : null });
+      if (liveCandidatePred) {
+        const acceptedGloss = liveCandidatePred.gloss;
+        acceptPrediction(liveCandidatePred);
+        liveSetText('liveStatus', 'Hand disappeared. Accepted: ' + acceptedGloss);
+        liveIsProcessing = false;
+        if (liveIsRunning) liveLoopTimer = setTimeout(runOneLiveCycle, LIVE_AFTER_ACCEPT_GAP_MS);
+        return;
+      }
+      liveSetText('liveStatus', 'Waiting for hand...');
+      liveIsProcessing = false;
+      if (liveIsRunning) liveLoopTimer = setTimeout(runOneLiveCycle, LIVE_NO_HAND_GAP_MS);
+      return;
+    }
+    const pred = extractPrediction(data);
+    liveSetJSON('liveRawResult', { ok:data.ok, current_prediction: pred ? {gloss:pred.gloss, confidence:pred.confidence} : null, top_k: data.result && data.result.top_k ? data.result.top_k.slice(0,5) : null });
+    if (pred) {
+      liveSetText('liveCurrentWord', pred.gloss);
+      liveSetText('liveConfidence', 'Confidence: ' + pred.confidence.toFixed(3));
+      if (shouldAcceptPrediction(pred)) {
+        acceptPrediction(pred);
+        liveSetText('liveStatus', 'Accepted: ' + pred.gloss + ' | Keep signing...');
+      } else {
+        if (pred.confidence < LIVE_MIN_CONFIDENCE) liveSetText('liveStatus', 'Low confidence ignored: ' + pred.gloss);
+        else liveSetText('liveStatus', 'Waiting for stable prediction: ' + pred.gloss);
+      }
+    } else {
+      liveSetText('liveCurrentWord','---');
+      liveSetText('liveConfidence','Confidence: ---');
+      if (liveCandidatePred) acceptPendingCandidateByRelease();
+      else liveSetText('liveStatus','No clear sign detected.');
+    }
+  } catch(err) {
+    liveSetText('liveStatus', 'Live error: ' + (err.message || String(err)));
+  }
+  liveIsProcessing = false;
+  if (liveIsRunning) liveLoopTimer = setTimeout(runOneLiveCycle, LIVE_LOOP_GAP_MS);
+}
+function startLiveTranslation() {
+  if (!liveStream) { alert('Open camera first.'); return; }
+  if (liveIsRunning) return;
+  liveIsRunning = true;
+  liveSetButton('liveStartBtn', true);
+  liveSetButton('liveStopBtn', false);
+  liveSetText('liveStatus', 'Live translation started. Perform one sign then release/hide your hand.');
+  runOneLiveCycle();
+}
+function stopLiveTranslation() {
+  liveIsRunning = false; liveIsProcessing = false;
+  if (liveLoopTimer) { clearTimeout(liveLoopTimer); liveLoopTimer = null; }
+  liveSetButton('liveStartBtn', false);
+  liveSetButton('liveStopBtn', true);
+  liveSetText('liveStatus', 'Live translation stopped.');
+}
+function clearLiveSentence() {
+  liveGlosses = []; liveWords = [];
+  liveLastAcceptedGloss = ''; liveLastAcceptedTime = 0;
+  liveCandidateGloss = ''; liveCandidateCount = 0; liveCandidatePred = null;
+  liveSetText('liveCurrentWord','---'); liveSetText('liveConfidence','Confidence: ---'); liveSetText('liveGlossSequence','---'); liveSetText('liveEnglishSentence','---'); liveSetJSON('liveRawResult','---');
+  liveSetAudio('liveTtsAudio', null); liveSetText('liveTtsMeta', '');
+  liveSetText('liveStatus', 'Sentence cleared.');
+}
+async function speakLiveSentence() {
+  const sentence = document.getElementById('liveEnglishSentence').textContent.trim();
+  if (!sentence || sentence === '---') { alert('No live sentence to speak yet.'); return; }
+  liveSetText('liveStatus', 'Generating speech using profile age/gender...');
+  liveSetAudio('liveTtsAudio', null);
+  const fd = new FormData();
+  fd.append('text', sentence);
+  fd.append('gender', PROFILE_GENDER);
+  fd.append('age', PROFILE_AGE);
+  try {
+    const response = await fetch(TTS_ENDPOINT, {method:'POST', body:fd});
+    const data = await response.json();
+    liveSetJSON('liveRawResult', {tts_request_text:sentence, profile_gender:PROFILE_GENDER, profile_age:PROFILE_AGE, tts_response:data});
+    if (data.ok && data.result && data.result.audio_url) {
+      const audioUrl = TTS_ENDPOINT.replace('/api/tts','') + data.result.audio_url;
+      liveSetAudio('liveTtsAudio', audioUrl);
+      liveSetText('liveTtsMeta', 'Voice: ' + (data.result.voice || '---') + ' | Speed: ' + (data.result.speed || '---') + ' | Age group: ' + (data.result.age_group || '---'));
+      const audio = document.getElementById('liveTtsAudio');
+      if (audio) await audio.play();
+      liveSetText('liveStatus', 'Speech generated and playing.');
+    } else {
+      liveSetText('liveStatus', 'TTS error. Check Raw Live Result.');
+    }
+  } catch(err) {
+    liveSetText('liveStatus', 'TTS error: ' + err.message);
+    liveSetJSON('liveRawResult', {ok:false, error:err.message});
+  }
+}
+window.addEventListener('beforeunload', function(){ stopLiveTranslation(); closeLiveCamera(); });
+</script>
+'''.replace("__CONFIG__", json.dumps(CONFIG))
+
+components.html(html, height=760, scrolling=True)
+
+
+# ===============================
+# Speech → Text section for hearing speaker
+# ===============================
+
+st.divider()
+st.header("🎙️ Speech to Text for the Deaf User")
+st.caption("If the hearing person wants to speak, record their voice here and convert it to text for the deaf user to read.")
+
+try:
+    audio_value = st.audio_input("Record voice message")
+except Exception:
+    audio_value = None
+    st.warning("Your Streamlit version may not support st.audio_input. Use upload below instead.")
+
+uploaded_audio = st.file_uploader(
+    "Or upload an audio file",
+    type=["wav", "mp3", "m4a", "ogg", "flac", "webm"],
+    key="live_stt_upload",
+)
+
+run_stt = st.button("Convert Speech to Text", type="primary", use_container_width=True)
+
+
+def _extract_text_from_stt_result(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return str(
+            result.get("text")
+            or result.get("transcript")
+            or result.get("clean_text")
+            or result.get("prediction")
+            or result.get("sentence")
+            or ""
+        )
+    return str(result or "")
+
+
+def _run_speech_to_text(audio_path: Path) -> Dict[str, Any]:
+    try:
+        import model_adapters.speech_to_text as speech_adapter
+
+        candidate_names = [
+            "transcribe_speech",
+            "speech_to_text",
+            "transcribe_audio",
+            "predict_speech",
+            "run_speech_to_text",
+            "predict",
+        ]
+
+        last_error = None
+        for name in candidate_names:
+            fn = getattr(speech_adapter, name, None)
+            if not callable(fn):
+                continue
+
+            call_attempts = [
+                lambda: fn(audio_path=str(audio_path)),
+                lambda: fn(audio_file=str(audio_path)),
+                lambda: fn(file_path=str(audio_path)),
+                lambda: fn(path=str(audio_path)),
+                lambda: fn(str(audio_path)),
+            ]
+
+            for attempt in call_attempts:
+                try:
+                    raw = attempt()
+                    text = _extract_text_from_stt_result(raw)
+                    return {"ok": True, "text": text, "raw_result": raw, "adapter_function": name}
+                except TypeError as exc:
+                    last_error = exc
+                    continue
+
+        return {
+            "ok": False,
+            "error": "No compatible speech-to-text adapter function found in model_adapters/speech_to_text.py",
+            "last_error": str(last_error) if last_error else None,
+        }
+
+    except Exception as exc:
+        import traceback
+        return {"ok": False, "error": str(exc), "traceback": traceback.format_exc(limit=8)}
+
+
+if run_stt:
+    source = audio_value or uploaded_audio
+    if source is None:
+        st.warning("Record or upload audio first.")
+        st.stop()
+
+    suffix = ".wav"
+    name = getattr(source, "name", "recording.wav") or "recording.wav"
+    if "." in name:
+        suffix = "." + name.split(".")[-1].lower()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(source.getvalue())
+        audio_path = Path(tmp.name)
+
+    st.audio(str(audio_path))
+
+    with st.spinner("Transcribing speech..."):
+        stt_result = _run_speech_to_text(audio_path)
+
+    if not stt_result.get("ok"):
+        st.error(stt_result.get("error", "Speech-to-text failed."))
+        with st.expander("Raw error", expanded=False):
+            st.json(stt_result)
+        st.stop()
+
+    st.success("Speech converted to text.")
+    st.markdown(
+        f"""
+        <div style="padding:22px;border-radius:18px;background:#f8fafc;border:1px solid #e5e7eb;">
+          <div style="font-size:14px;color:#64748b;margin-bottom:8px;">Text for the deaf user to read</div>
+          <div style="font-size:34px;font-weight:900;color:#0f766e;line-height:1.35;">{stt_result.get('text') or '---'}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("Raw STT result", expanded=False):
+        st.json(stt_result)
+
+    try:
+        audio_path.unlink(missing_ok=True)
+    except Exception:
+        pass
